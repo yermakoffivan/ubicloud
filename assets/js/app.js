@@ -669,6 +669,12 @@ function setupMetricsCharts() {
   $('#metrics-container #time-range').on('change', resetMetricsZoom);
   $('#metrics-container #refresh-button').on('click', updateMetricsCharts);
   $('#metrics-container #reset-zoom-button').on('click', resetMetricsZoom);
+  $('#metrics-container #node-filter').on('change', function () {
+    for (const chartInstance of metricsCharts) {
+      const names = (chartInstance.chart.getOption().series || []).map(series => series.name);
+      chartInstance.chart.setOption({ legend: { selected: metricsLegendSelection(names) } });
+    }
+  });
 
   $('#metrics-container').on('click', '.maximize-chart-button', function () {
     toggleChartMaximize($(this).closest('.metric-chart-card'));
@@ -820,6 +826,21 @@ function toggleChartMaximize(card) {
   }
 }
 
+// Hides the series belonging to the nodes the filter is not showing. Series
+// not named after a node, such as the per-verb or per-direction ones, are
+// always kept, and charts without the filter keep every series.
+function metricsLegendSelection(seriesNames) {
+  const filter = $('#metrics-container #node-filter');
+  const node = filter.val() || 'all';
+  const nodes = filter.find('option').map(function () { return this.value; }).get();
+  const selected = {};
+  for (const name of seriesNames) {
+    const owner = nodes.find(value => value !== 'all' && (name === value || name.endsWith(' ' + value)));
+    selected[name] = node === 'all' || !owner || owner === node;
+  }
+  return selected;
+}
+
 function queryAndUpdateChart(chartInstance, start_time, end_time) {
   const metricKey = chartInstance.key;
   const params = {
@@ -850,9 +871,12 @@ function queryAndUpdateChart(chartInstance, start_time, end_time) {
           const value = Number(Number(item[1]).toFixed(2));
           return [ts, value]
         });
-        const labelKeys = Object.keys(series["labels"]);
-        const firstKey = labelKeys[0];
-        const seriesName = series["labels"][firstKey] || series["labels"]["name"] || metric["name"];
+        const labels = series["labels"];
+        const nameParts = Object.keys(labels)
+          .filter(key => key !== "name" && key !== "__name__")
+          .map(key => labels[key]);
+        nameParts.unshift(labels["name"]);
+        const seriesName = nameParts.filter(Boolean).join(" ") || metric["name"];
 
         chartSeries.push({
           name: seriesName,
@@ -877,6 +901,7 @@ function queryAndUpdateChart(chartInstance, start_time, end_time) {
         legend: {
           type: 'scroll',
           data: chartSeries.map(series => series.name),
+          selected: metricsLegendSelection(chartSeries.map(series => series.name)),
           right: '2%',
         },
         xAxis: {

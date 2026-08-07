@@ -451,6 +451,16 @@ RSpec.describe Clover, "Kubernetes" do
         end
       end
 
+      it "offers a node filter listing every node in the cluster" do
+        kc.strand.update(label: "wait")
+        kc.update(kubeconfig: "stored")
+
+        visit "#{project.path}#{kc.path}/charts"
+
+        options = find_by_id("node-filter").all("option").map(&:value)
+        expect(options).to eq ["all"] + kc.all_nodes.map(&:name)
+      end
+
       it "tells the user metrics are unavailable while the cluster is creating" do
         visit "#{project.path}#{kc.path}/charts"
 
