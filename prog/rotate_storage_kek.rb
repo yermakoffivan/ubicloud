@@ -27,6 +27,14 @@ class Prog::RotateStorageKek < Prog::Base
       new_key: vm_storage_volume.key_encryption_key_2.secret_key_material_hash,
     })
 
+    hop_retire_key_backup
+  end
+
+  label def retire_key_backup
+    # Delete the backup before the database swap, while key_1 is still the old
+    # key, so the host can name the backup file explicitly.
+    storage_key_tool("retire-backup", {old_key: vm_storage_volume.key_encryption_key_1.secret_key_material_hash})
+
     hop_retire_old_key_in_database
   end
 

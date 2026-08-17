@@ -30,6 +30,8 @@ volume = StorageVolume.new(vm_name, volume_params)
 case action
 when "rotate"
   volume.rewrite_secrets(params.fetch("old_key"), params.fetch("new_key"))
+when "retire-backup"
+  volume.retire_key_backup(params.fetch("old_key"))
 else
   puts "invalid action : #{action}"
   exit 1

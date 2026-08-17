@@ -95,7 +95,15 @@ RSpec.describe Prog::RotateStorageKek do
     it "re-wraps the key on the host in one call & hops" do
       expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* 0 rotate/,
         stdin: "{\"old_key\":{\"key\":\"key_1\",\"init_vector\":\"iv_1\",\"algorithm\":\"aes-256-gcm\",\"auth_data\":\"somedata\"},\"new_key\":{\"key\":\"key_2\",\"init_vector\":\"iv_2\",\"algorithm\":\"aes-256-gcm\",\"auth_data\":\"somedata\"}}")
-      expect { rsk.rotate }.to hop("retire_old_key_in_database")
+      expect { rsk.rotate }.to hop("retire_key_backup")
+    end
+  end
+
+  describe "#retire_key_backup" do
+    it "removes the old-key backup on the host with the old key & hops" do
+      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* 0 retire-backup/,
+        stdin: "{\"old_key\":{\"key\":\"key_1\",\"init_vector\":\"iv_1\",\"algorithm\":\"aes-256-gcm\",\"auth_data\":\"somedata\"}}")
+      expect { rsk.retire_key_backup }.to hop("retire_old_key_in_database")
     end
   end
 
