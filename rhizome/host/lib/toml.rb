@@ -5,6 +5,20 @@ module Toml
     "[#{name}]\n#{hash.map { |k, v| "#{k} = #{toml_value(v)}" }.join("\n")}\n"
   end
 
+  # Read a basic-string value written by toml_section: the +key+ under +table+.
+  # Returns nil when the table or key is absent.
+  def toml_string(text, table, key)
+    in_table = false
+    text.each_line do |line|
+      if (m = line.match(/^\s*\[([^\]]+)\]\s*$/))
+        in_table = (m[1] == table)
+      elsif in_table && (m = line.match(/^\s*#{Regexp.escape(key)}\s*=\s*"([^"]*)"/))
+        return m[1]
+      end
+    end
+    nil
+  end
+
   def toml_value(v)
     case v
     when String then toml_str(v)
