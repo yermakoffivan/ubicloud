@@ -5,37 +5,27 @@ require "json"
 class Prog::RotateStorageKek < Prog::Base
   subject_is :vm_storage_volume
 
-  label def start
-    if vm_storage_volume.key_encryption_key_1_id.nil?
-      pop "storage volume is not encrypted"
+  def self.assemble(vm_storage_volume_id)
+    DB.transaction do
+      # Lock the row so two callers can't both mint a second key and race a
+      # rotation against each other.
+      vm_storage_volume = VmStorageVolume.where(id: vm_storage_volume_id).for_update.first
+      fail "storage volume not found" unless vm_storage_volume
+      fail "storage volume is not encrypted" unless vm_storage_volume.key_encryption_key_1_id
+      fail "a key rotation is already in progress" if vm_storage_volume.key_encryption_key_2_id
+
+      key_encryption_key = StorageKeyEncryptionKey.create_random(auth_data: vm_storage_volume.device_id)
+      vm_storage_volume.update(key_encryption_key_2_id: key_encryption_key.id)
+
+      Strand.create(prog: "RotateStorageKek", label: "rotate", stack: [{"subject_id" => vm_storage_volume_id}])
     end
-
-    key_encryption_key = StorageKeyEncryptionKey.create_random(auth_data: vm_storage_volume.device_id)
-    vm_storage_volume.update({key_encryption_key_2_id: key_encryption_key.id})
-
-    hop_install
   end
 
-  label def install
-    storage_key_tool("reencrypt", {
+  label def rotate
+    storage_key_tool("rotate", {
       old_key: vm_storage_volume.key_encryption_key_1.secret_key_material_hash,
       new_key: vm_storage_volume.key_encryption_key_2.secret_key_material_hash,
     })
-
-    hop_test_keys_on_server
-  end
-
-  label def test_keys_on_server
-    storage_key_tool("test-keys", {
-      old_key: vm_storage_volume.key_encryption_key_1.secret_key_material_hash,
-      new_key: vm_storage_volume.key_encryption_key_2.secret_key_material_hash,
-    })
-
-    hop_retire_old_key_on_server
-  end
-
-  label def retire_old_key_on_server
-    storage_key_tool("retire-old-key", {})
 
     hop_retire_old_key_in_database
   end
@@ -59,10 +49,11 @@ class Prog::RotateStorageKek < Prog::Base
 
   private
 
-  def storage_key_tool(subcommand, json)
-    vm_name = vm.inhost_name
-    disk_index = vm_storage_volume.disk_index
-    device = vm_storage_volume.storage_device.name
-    sshable.cmd("sudo host/bin/storage-key-tool :vm_name :device :disk_index :subcommand", vm_name:, device:, disk_index:, subcommand:, stdin: JSON.generate(json))
+  def storage_key_tool(action, stdin)
+    sshable.cmd("sudo host/bin/storage-key-tool :vm_name :disk_index :action", vm_name:, disk_index:, action:, stdin: JSON.generate(stdin))
   end
+
+  def vm_name = vm.inhost_name
+
+  def disk_index = vm_storage_volume.disk_index
 end

@@ -52,45 +52,55 @@ RSpec.describe Prog::RotateStorageKek do
     allow(rsk).to receive(:vm_storage_volume).and_return(volume)
   end
 
-  describe "#start" do
-    it "creates a key & hops to install" do
-      expect(StorageKeyEncryptionKey).to receive(:create).and_return(current_kek)
-      expect(volume).to receive(:update).with({key_encryption_key_2_id: current_kek.id})
-      expect { rsk.start }.to hop("install")
+  describe ".assemble" do
+    let(:storage_device) {
+      StorageDevice.create(name: "nvme0", total_storage_gib: 100, available_storage_gib: 20)
+    }
+
+    def create_volume(key_1_id:, key_2_id: nil)
+      VmStorageVolume.create(vm_id: create_vm.id, boot: true, size_gib: 20, disk_index: 0,
+        use_bdev_ubi: false, storage_device_id: storage_device.id,
+        key_encryption_key_1_id: key_1_id, key_encryption_key_2_id: key_2_id)
     end
 
-    it "pops if not encrypted volume" do
-      unencrypted_volume = instance_double(VmStorageVolume)
-      expect(unencrypted_volume).to receive(:key_encryption_key_1_id).and_return(nil)
-      expect(rsk).to receive(:vm_storage_volume).and_return(unencrypted_volume)
-      expect { rsk.start }.to exit({"msg" => "storage volume is not encrypted"})
+    it "mints a second key and creates a strand that starts at rotate" do
+      encryption_key = StorageKeyEncryptionKey.create_random(auth_data: "somedata")
+      vol = create_volume(key_1_id: encryption_key.id)
+
+      strand = nil
+      expect { strand = described_class.assemble(vol.id) }.to change(StorageKeyEncryptionKey, :count).by(1)
+      expect(strand.prog).to eq("RotateStorageKek")
+      expect(strand.label).to eq("rotate")
+      expect(strand.stack.first["subject_id"]).to eq(vol.id)
+      expect(vol.reload.key_encryption_key_2_id).not_to be_nil
+    end
+
+    it "fails when the volume does not exist" do
+      expect { described_class.assemble(VmStorageVolume.generate_uuid) }.to raise_error("storage volume not found")
+    end
+
+    it "fails when the volume is not encrypted" do
+      vol = create_volume(key_1_id: nil)
+      expect { described_class.assemble(vol.id) }.to raise_error("storage volume is not encrypted")
+    end
+
+    it "fails when a rotation is already in progress" do
+      vol = create_volume(key_1_id: StorageKeyEncryptionKey.create_random(auth_data: "k1").id,
+        key_2_id: StorageKeyEncryptionKey.create_random(auth_data: "k2").id)
+      expect { described_class.assemble(vol.id) }.to raise_error("a key rotation is already in progress")
     end
   end
 
-  describe "#install" do
-    it "installs the key & hops" do
-      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* nvme0 0 reencrypt/,
+  describe "#rotate" do
+    it "re-wraps the key on the host in one call & hops" do
+      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* 0 rotate/,
         stdin: "{\"old_key\":{\"key\":\"key_1\",\"init_vector\":\"iv_1\",\"algorithm\":\"aes-256-gcm\",\"auth_data\":\"somedata\"},\"new_key\":{\"key\":\"key_2\",\"init_vector\":\"iv_2\",\"algorithm\":\"aes-256-gcm\",\"auth_data\":\"somedata\"}}")
-      expect { rsk.install }.to hop("test_keys_on_server")
-    end
-  end
-
-  describe "#test_keys_on_server" do
-    it "can test keys on server" do
-      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* nvme0 0 test-keys/, stdin: /.*/)
-      expect { rsk.test_keys_on_server }.to hop("retire_old_key_on_server")
-    end
-  end
-
-  describe "#retire_old_key_on_server" do
-    it "can retire old keys on server" do
-      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/storage-key-tool .* nvme0 0 retire-old-key/, stdin: "{}")
-      expect { rsk.retire_old_key_on_server }.to hop("retire_old_key_in_database")
+      expect { rsk.rotate }.to hop("retire_old_key_in_database")
     end
   end
 
   describe "#retire_old_key_in_database" do
-    it "can retire old keys on database" do
+    it "swaps the new key in and pops" do
       expect(volume).to receive(:update).with({key_encryption_key_1_id: new_kek.id, key_encryption_key_2_id: nil})
       expect { rsk.retire_old_key_in_database }.to exit({"msg" => "key rotated successfully"})
     end
