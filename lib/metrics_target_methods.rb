@@ -6,6 +6,7 @@ module MetricsTargetMethods
   METRICS_BACKLOG_THRESHOLD_SECONDS = 300
   METRICS_BACKLOG_PAGE_TAGS = {
     "PostgresServer" => "PGMetricsBacklogHigh",
+    "KubernetesNode" => "KubernetesMetricsBacklogHigh",
   }.freeze
 
   def metrics_config
