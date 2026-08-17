@@ -5,6 +5,7 @@ require "json"
 class Prog::Test::Vm < Prog::Test::Base
   subject_is :vm, :sshable
   frame_reader :first_boot
+  frame_accessor :rotate_strand_ids
 
   label def start
     hop_verify_dd
@@ -35,8 +36,7 @@ class Prog::Test::Vm < Prog::Test::Base
         sha256 = sshable.cmd("head -c 1M /dev/urandom | tee /tmp/persistence-test | sha256sum | awk '{print $1}'").strip
         sshable.cmd("mv /tmp/persistence-test :file", file: File.join("/home/ubi/persistence_test", sha256))
       end
-      # The pre-reboot pass is on the critical path, so it keeps only the disk and network checks plus seeding the persistence data.
-      hop_ping_google
+      hop_rotate_storage_keys
     else
       files = sshable.cmd("ls ~/persistence_test").split
       fail_test "persistence test: unexpected number of files" if files.size != num_files
@@ -47,6 +47,18 @@ class Prog::Test::Vm < Prog::Test::Base
       end
       hop_install_packages
     end
+  end
+
+  label def rotate_storage_keys
+    self.rotate_strand_ids = vm.vm_storage_volumes
+      .select(&:key_encryption_key_1_id)
+      .map { |volume| Prog::RotateStorageKek.assemble(volume.id).id }
+    hop_wait_rotate_storage_keys
+  end
+
+  label def wait_rotate_storage_keys
+    nap 10 if rotate_strand_ids.any? { |id| Strand[id] }
+    hop_ping_google
   end
 
   label def install_packages
