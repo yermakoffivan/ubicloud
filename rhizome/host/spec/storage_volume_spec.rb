@@ -1043,4 +1043,180 @@ RSpec.describe StorageVolume do
       expect { encrypted_vhost_sv.stop_service_if_loaded("test-2-storage.service") }.to raise_error(CommandFail, /unexpected error/)
     end
   end
+
+  describe "#rewrite_secrets" do
+    let(:dir) { Dir.mktmpdir }
+    let(:old_kek) { make_kek }
+    let(:new_kek) { make_kek }
+    let(:dek_key) { SecureRandom.random_bytes(32).unpack1("H*") }
+    let(:dek_key2) { SecureRandom.random_bytes(32).unpack1("H*") }
+    let(:dek) { {cipher: "AES_XTS", key: dek_key, key2: dek_key2} }
+    let(:spdk_file) { File.join(dir, "data_encryption_key.json") }
+    let(:legacy_file) { File.join(dir, "vhost-backend.conf") }
+    let(:v2_file) { File.join(dir, "vhost-backend-secrets.conf") }
+
+    after { FileUtils.rm_rf(dir) }
+
+    def make_kek(key = SecureRandom.random_bytes(32))
+      {
+        "algorithm" => "aes-256-gcm",
+        "key" => Base64.strict_encode64(key),
+        "init_vector" => Base64.strict_encode64(SecureRandom.random_bytes(12)),
+        "auth_data" => "Ubicloud-Storage-Auth",
+      }
+    end
+
+    before do
+      allow(FileUtils).to receive(:chown)
+      allow_any_instance_of(StoragePath).to receive(:storage_dir).and_return(dir)
+      allow_any_instance_of(StoragePath).to receive(:data_encryption_key).and_return(spdk_file)
+      allow_any_instance_of(StoragePath).to receive(:vhost_backend_config).and_return(legacy_file)
+      allow_any_instance_of(StoragePath).to receive(:vhost_backend_secrets_config).and_return(v2_file)
+    end
+
+    def volume(version, archive: false, remote: false)
+      params = {"disk_index" => 0, "storage_device" => "nvme0", "device_id" => "vm12345_0",
+                "encrypted" => true, "size_gib" => 20, "vhost_block_backend_version" => version}
+      if archive
+        params["archive_source"] = {
+          "bucket" => "b", "prefix" => "p", "region" => "auto", "endpoint" => "https://e", "autofetch" => true,
+          "encrypted_access_key_id" => v2_wrap(old_kek, "archive-access-key", access_key),
+          "encrypted_secret_access_key" => v2_wrap(old_kek, "archive-secret-key", secret_key),
+          "encrypted_archive_kek" => v2_wrap(old_kek, "archive-kek", archive_kek),
+        }
+      end
+      if remote
+        params["remote_source"] = {
+          "address" => "10.0.0.1:9999", "psk_identity" => "id", "autofetch" => true, "disk_size_bytes" => 1,
+          "encrypted_psk" => v2_wrap(old_kek, "remote-psk", psk_plaintext),
+        }
+      end
+      StorageVolume.new("vm12345", params)
+    end
+
+    def v2_wrap(kek, name, plaintext)
+      Base64.strict_encode64(StorageKeyEncryption.aes256gcm_encrypt(Base64.decode64(kek["key"]), name, plaintext))
+    end
+
+    # Write each backend's on-disk file the way prep does, wrapped with +kek+.
+    def write_spdk(kek)
+      StorageKeyEncryption.new(kek).write_encrypted_dek(spdk_file, dek)
+    end
+
+    def write_legacy(kek)
+      ke = StorageKeyEncryption.new(kek)
+      wrap = ->(hex) { Base64.strict_encode64(ke.wrap_key([hex].pack("H*")).join) }
+      File.write(legacy_file, {"path" => "/d/disk.raw", "encryption_key" => [wrap.call(dek_key), wrap.call(dek_key2)]}.to_yaml)
+    end
+
+    def write_v2(vol, kek)
+      File.write(v2_file, vol.v2_secrets_toml({key: dek_key, key2: dek_key2}, kek))
+    end
+
+    # After rotation the live file unwraps to the original DEK under the new KEK,
+    # and no longer under the old KEK.
+    def expect_rotated(vol)
+      live = vol.config_key_file
+      expect(vol.read_config_dek(live, new_kek)).to eq(dek)
+      expect { vol.read_config_dek(live, old_kek) }.to raise_error(OpenSSL::Cipher::CipherError)
+      expect(File.exist?("#{live}.new")).to be(false)
+    end
+
+    it "rotates an spdk volume" do
+      write_spdk(old_kek)
+      vol = volume(nil)
+      vol.rewrite_secrets(old_kek, new_kek)
+      expect_rotated(vol)
+      expect(File.exist?(spdk_file)).to be(true) # spdk file is the rotation target
+    end
+
+    it "rotates a legacy ubiblk volume" do
+      write_legacy(old_kek)
+      vol = volume("v0.3.1")
+      vol.rewrite_secrets(old_kek, new_kek)
+      expect_rotated(vol)
+    end
+
+    it "rotates a config-v2 ubiblk volume and removes the stale spdk key file" do
+      write_spdk(old_kek)
+      vol = volume("v0.4.2")
+      write_v2(vol, old_kek)
+      vol.rewrite_secrets(old_kek, new_kek)
+      expect_rotated(vol)
+      expect(File.exist?(spdk_file)).to be(false)
+    end
+
+    context "with a config-v2 archive source" do
+      let(:access_key) { "AKIAEXAMPLE" }
+      let(:secret_key) { "secret/value" }
+      let(:archive_kek) { SecureRandom.random_bytes(32) }
+
+      it "re-wraps every archive secret with the new KEK, preserving the plaintexts" do
+        vol = volume("v0.4.2", archive: true)
+        write_v2(vol, old_kek)
+        vol.rewrite_secrets(old_kek, new_kek)
+        expect_rotated(vol)
+
+        text = File.read(v2_file)
+        {"archive-access-key" => access_key, "archive-secret-key" => secret_key, "archive-kek" => archive_kek}.each do |name, plaintext|
+          wrapped = Base64.decode64(vol.v2_inline(text, "secrets.#{name}"))
+          expect(StorageKeyEncryption.aes256gcm_decrypt(Base64.decode64(new_kek["key"]), name, wrapped)).to eq(plaintext)
+        end
+      end
+    end
+
+    context "with a config-v2 remote source" do
+      let(:psk_plaintext) { SecureRandom.random_bytes(32) }
+
+      it "re-wraps the remote-psk secret with the new KEK, preserving the plaintext" do
+        vol = volume("v0.4.2", remote: true)
+        write_v2(vol, old_kek)
+        vol.rewrite_secrets(old_kek, new_kek)
+        expect_rotated(vol)
+
+        wrapped = Base64.decode64(vol.v2_inline(File.read(v2_file), "secrets.remote-psk"))
+        expect(StorageKeyEncryption.aes256gcm_decrypt(Base64.decode64(new_kek["key"]), "remote-psk", wrapped)).to eq(psk_plaintext)
+      end
+    end
+
+    it "writes the rotated file 0600 owned by the VM user before any secret lands" do
+      write_v2(volume("v0.4.2"), old_kek)
+      vol = volume("v0.4.2")
+      expect(FileUtils).to receive(:chown).with("vm12345", "vm12345", "#{v2_file}.new.tmp")
+      vol.rewrite_secrets(old_kek, new_kek)
+      expect(File.stat(v2_file).mode & 0o777).to eq(0o600)
+    end
+
+    it "is a safe no-op on retry after a completed rotation (lost ack)" do
+      write_v2(volume("v0.4.2"), old_kek)
+      vol = volume("v0.4.2")
+      vol.rewrite_secrets(old_kek, new_kek)
+      expect { vol.rewrite_secrets(old_kek, new_kek) }.not_to raise_error
+      expect_rotated(vol)
+    end
+
+    it "raises and leaves the live file intact when it opens with neither KEK" do
+      unrelated = make_kek # wrapped with a KEK that is neither old nor new
+      write_spdk(unrelated)
+      vol = volume(nil)
+      expect { vol.rewrite_secrets(old_kek, new_kek) }.to raise_error(OpenSSL::Cipher::CipherError)
+      expect(vol.read_config_dek(spdk_file, unrelated)).to eq(dek) # live untouched, .new never renamed
+    end
+
+    it "verify_rotated_secrets fails when the rotated file encodes a different DEK" do
+      vol = volume(nil)
+      backup = "#{spdk_file}.old"
+      rotated = "#{spdk_file}.new"
+      StorageKeyEncryption.new(old_kek).write_encrypted_dek(backup, dek)
+      different = {cipher: "AES_XTS", key: SecureRandom.random_bytes(32).unpack1("H*"), key2: dek_key2}
+      StorageKeyEncryption.new(new_kek).write_encrypted_dek(rotated, different)
+      expect { vol.verify_rotated_secrets(backup, old_kek, rotated, new_kek) }.to raise_error(/data-encryption key changed after rotation/)
+    end
+
+    it "fails loudly when the config-v2 xts-key section is missing" do
+      File.write(v2_file, "[secrets.kek]\nsource.file = \"/x/kek.pipe\"\n")
+      vol = volume("v0.4.2")
+      expect { vol.read_config_dek(v2_file, old_kek) }.to raise_error(/no \[secrets\.xts-key\] source\.inline/)
+    end
+  end
 end
