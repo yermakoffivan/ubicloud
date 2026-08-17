@@ -3,6 +3,10 @@
 module MetricsTargetMethods
   MAX_SCRAPE_FETCH_COUNT = 4
   FILENAME_FORMAT = "%Y-%m-%dT%H-%M-%S-%N"
+  METRICS_BACKLOG_THRESHOLD_SECONDS = 300
+  METRICS_BACKLOG_PAGE_TAGS = {
+    "PostgresServer" => "PGMetricsBacklogHigh",
+  }.freeze
 
   def metrics_config
     {
@@ -47,6 +51,24 @@ module MetricsTargetMethods
 
     mark_pending_scrapes_as_done(session, scrape_results[-1].time)
     scrape_results.count
+  end
+
+  def observe_metrics_backlog(session)
+    metrics_done_dir = "#{metrics_dir}/done"
+    result = session[:ssh_session].exec!("find :metrics_done_dir -name '*.txt' | wc -l", metrics_done_dir:)
+    metrics_backlog = Integer(result.strip, 10)
+    metrics_interval = metrics_config[:interval].to_i
+    tag = METRICS_BACKLOG_PAGE_TAGS.fetch(self.class.name)
+
+    if metrics_backlog * metrics_interval > METRICS_BACKLOG_THRESHOLD_SECONDS
+      Prog::PageNexus.assemble("#{ubid} metrics backlog high",
+        [tag, id], ubid,
+        severity: "warning", extra_data: {metrics_backlog:})
+    elsif metrics_backlog * metrics_interval < METRICS_BACKLOG_THRESHOLD_SECONDS * 0.8
+      Page.from_tag_parts(tag, id)&.incr_resolve
+    end
+  rescue => ex
+    Clog.emit("Failed to observe metrics backlog", Util.exception_to_hash(ex, into: {"#{self.class.table_name}_id": id}))
   end
 
   def scrape_endpoints(session)
